@@ -1,0 +1,117 @@
+WITH profile AS (
+    SELECT
+        profile.fid,
+        profile.fname,
+        profile.display_name,
+        profile.avatar_url,
+        ROW_NUMBER() OVER (PARTITION BY profile.fid ORDER BY LENGTH(profile.verified_addresses) DESC NULLS LAST) AS rn
+    FROM dune.neynar.dataset_farcaster_profile_with_addresses profile
+),
+tips AS (
+    SELECT
+        -- Tip allowances are loaded at 7:35 UTC. Casts after midnight until then 
+        -- are made against the previous day's tip allowance.
+        DATE_TRUNC('day', casts.timestamp - INTERVAL '7' HOUR - INTERVAL '35' MINUTE) AS event_day,
+        casts.timestamp,
+        casts.parent_fid AS recipient_fid,
+        casts.fid AS donor_fid,
+        CAST(REGEXP_EXTRACT(REGEXP_EXTRACT(UPPER(casts.text), '([0-9]+) \$DEGEN'), '[0-9]+') AS DOUBLE) AS tip_amount,
+        CASE
+            WHEN root_parent_url IN (
+                'chain://eip155:8453/erc721:0x1e5115dc60cdab3c1263a945201cb509ea7a8340', -- FarcastHER
+                'chain://eip155:1/erc721:0x2A9EA02E4c2dcd56Ba20628Fe1bd46bAe2C62746', -- FarCon
+                'https://warpcast.com/~/channel/frames', --Fframes
+                'https://onchainsummer.xyz', -- Base
+                'chain://eip155:1/erc721:0x7dd4e31f1530ac682c8ea4d8016e95773e08d8b0', -- Dev
+                'chain://eip155:7777777/erc721:0x22be981fb87effbe6780b34a6fe1dfc14a00ec8e', -- Design
+                'chain://eip155:7777777/erc721:0x3d037b11c5359fac54c3928dfad0b9512695d392', -- Frontend
+                'https://farcaster.group/founders', -- Founders
+                'https://warpcast.com/~/channel/perl', -- Perl
+                'https://farcaster.group/product', -- Product
+                'chain://eip155:1/erc721:0xca21d4228cdcc68d4e23807e5e370c07577dd152' -- Zora
+            ) THEN 1.5
+            ELSE 1.0
+        END AS channel_boost
+    FROM
+        dune.neynar.dataset_farcaster_casts casts
+    WHERE
+        casts.fid NOT IN (217745, 234434, 244128) -- Exclude @degenbot, @degentip, @degentokenbase
+        AND REGEXP_LIKE(UPPER(casts.text), '[0-9]+ \$DEGEN')
+        AND casts.parent_hash IS NOT NULL
+        AND casts.deleted_at IS NULL
+        AND casts.timestamp > TO_DATE('20240330', 'yyyymmdd')
+        AND casts.parent_fid <> casts.fid
+),
+daily_donated_tips AS (
+    SELECT
+        tips.event_day,
+        tips.recipient_fid,
+        tips.donor_fid,
+        tips.tip_amount,
+        tips.channel_boost,
+        SUM(tips.tip_amount) OVER (
+            PARTITION BY tips.event_day, tips.donor_fid
+            ORDER BY tips.tip_amount DESC, tips.timestamp
+        ) AS donated_amount,
+        allowance.tip_allowance AS donor_tip_allowance
+    FROM
+        tips
+    INNER JOIN
+        dune.degentokenbase.result_airdrop_2_tip_allocations allowance
+            ON allowance.snapshot_date = tips.event_day
+            AND allowance.fid = tips.donor_fid
+    WHERE
+        tips.tip_amount <> 0
+),
+daily_received_tips AS (
+    SELECT
+        event_day,
+        recipient_fid,
+        SUM(tip_amount * channel_boost) AS received_amount
+    FROM
+        daily_donated_tips
+    WHERE
+        donated_amount <= donor_tip_allowance * 1.03
+    GROUP BY
+        event_day,
+        recipient_fid
+),
+received_tips AS (
+    SELECT
+        recipient_fid AS fid,
+        SUM(received_amount) AS total_received_amount
+    FROM
+        daily_received_tips
+    GROUP BY
+        recipient_fid
+)
+SELECT
+    rec.fid,
+    profile.fname,
+    profile.display_name,
+    COALESCE(ovrrd.address, verified_eth_addresses.address) AS wallet_address,
+    ROUND(rec.total_received_amount, 0) AS points,
+    SUM(ROUND(rec.total_received_amount, 0)) OVER () AS all_received_amount
+FROM
+    received_tips rec
+LEFT JOIN
+    profile
+        ON profile.fid = rec.fid
+        AND profile.rn = 1
+LEFT JOIN
+    query_3464901 verified_eth_addresses
+        ON verified_eth_addresses.fid = rec.fid
+        AND verified_eth_addresses.rn = 1
+LEFT JOIN
+    query_3423915 ovrrd
+        ON ovrrd.fid = rec.fid
+LEFT JOIN
+    query_3444616 disqualified
+        ON disqualified.fid = rec.fid
+WHERE
+    COALESCE(ovrrd.address, verified_eth_addresses.address) IS NOT NULL
+    AND profile.display_name IS NOT NULL
+    AND disqualified.fid IS NULL
+ORDER BY
+    rec.total_received_amount DESC
+;
